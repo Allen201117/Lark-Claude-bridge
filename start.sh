@@ -11,4 +11,5 @@ mkdir -p "$LOGDIR"
 LOG="$LOGDIR/bridge.log"
 
 echo "[start] $(date) 启动桥接…" >> "$LOG"
-exec caffeinate -s /usr/bin/python3 bridge.py >> "$LOG" 2>&1
+# 不用 exec：让有 FDA 的 bash 留作父进程，子进程(python/claude)才稳继承磁盘权限
+caffeinate -s /usr/bin/python3 bridge.py >> "$LOG" 2>&1
