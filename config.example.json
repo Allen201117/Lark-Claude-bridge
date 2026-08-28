@@ -1,5 +1,8 @@
 {
-  "owner_open_id": "ou_xxxxxxxx（你的飞书 open_id，跑 `lark-cli auth status` 可查）",
-  "workdir": "/Users/你的用户名/你的项目目录",
-  "permission_mode": "bypassPermissions"
+  "owner_open_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "workdir": "/Users/you/Documents/YourProject",
+  "permission_mode": "acceptEdits",
+  "arm_passphrase": "",
+  "arm_ttl_minutes": 60,
+  "allowed_roots": ["/Users/you/Desktop", "/Users/you/Documents"]
 }

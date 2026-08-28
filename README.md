@@ -49,7 +49,14 @@ cp config.example.json ~/.feishu-claude-bridge/config.json
 
 ## 注意
 
-- **权限**：默认 `bypassPermissions`（Claude 能改文件、跑命令，才能真正远程干活）。已用 open_id 白名单锁死只有你本人能遥控；想更保守把 config 里改成 `acceptEdits`。
+- **权限（默认收敛，要跑命令得先提权）**：
+  威胁模型说清楚——`open_id` 白名单只有「飞书账号」一个因子，账号被盗就等于把整台 Mac 的 shell 交出去。所以默认不再全放开：
+  - 平时跑 `acceptEdits`：**能改文件，跑命令被挡**。
+  - 要跑命令：飞书发 `/arm <口令>` 临时提权（默认 60 分钟，到点自动降回，进程重启也一律降权）；用完 `/disarm` 立即收回；`/security` 看当前状态。
+  - 口令是**第二因子**——光偷到飞书账号跑不了命令。先在 config 里设 `arm_passphrase`，不设 `/arm` 不可用。
+  - ⚠️ 老配置里写死的 `permission_mode: "bypassPermissions"` 会被**自动收敛**为 `acceptEdits` 并在启动日志告警。
+- **目录白名单**：`allowed_roots` 限定 `/cd` 和启动目录的范围，默认只放开 `~/Desktop` 和 `~/Documents`，把 `~/.ssh` `~/.aws` `~/.claude` `~/Library` 挡在外面（软链穿越也会被解析后拦下）。
+- **高危指令不走远程通道**：递归删除 / sudo / 下载即执行 / 读 SSH 与凭据 / `.env` / force push 这类指令直接拒绝，让你自己坐到电脑前做。判据在 `bridge.py` 的 `DANGER_PATTERNS`，误伤了自己改。
 - **别接正在进行的超长会话**：接上会加载全量上下文，又慢又贵。已加单任务 15 分钟超时 + 心跳兜底。
 - **别在电脑和手机同时敲同一个会话**，会互相写乱。
 

@@ -36,11 +36,71 @@ _cfg = load_config()
 # 只有这个人发的消息才会被执行（= 你自己）。防止别人遥控你的电脑。
 OWNER_OPEN_ID = os.environ.get("FCB_OWNER_OPEN_ID") or _cfg.get("owner_open_id") or ""
 
-# Claude 权限模式。远程无人值守要真正干活（改文件/跑命令）就得放开权限。
-#   bypassPermissions = 全放开（能改文件、能跑命令）。方便但有风险：
-#   任何能用你飞书账号给机器人发消息的人，都能在你 Mac 上跑命令。已用 OWNER 白名单兜底。
-#   也可改成 "acceptEdits"（只自动批准改文件，跑命令仍会被挡）。
-PERMISSION_MODE = _cfg.get("permission_mode", "bypassPermissions")
+# ─────────────────── 权限：默认收敛 + 临时提权（arm）───────────────────
+# 威胁模型：OWNER 白名单只有「飞书账号」这一个因子。账号一旦被盗，
+# bypassPermissions 就等于把整台 Mac 的 shell 交出去。所以：
+#   · 平时跑在 BASE_MODE（默认 acceptEdits：能改文件，跑命令仍被挡）
+#   · 要跑命令时发 /arm <口令> 临时提权，到点自动降回去
+# 口令是第二因子——光偷到飞书账号，跑不了命令。
+BASE_MODE = _cfg.get("permission_mode", "acceptEdits")
+if BASE_MODE == "bypassPermissions":
+    # 旧配置直接写死全放开 → 收敛为「需 /arm 才提权」，不再默认放开
+    BASE_MODE = "acceptEdits"
+    _LEGACY_BYPASS = True
+else:
+    _LEGACY_BYPASS = False
+ELEVATED_MODE = "bypassPermissions"
+ARM_PASSPHRASE = os.environ.get("FCB_ARM_PASSPHRASE") or _cfg.get("arm_passphrase") or ""
+ARM_TTL = int(_cfg.get("arm_ttl_minutes", 60)) * 60
+
+# 目录白名单：/cd 和启动目录都必须落在这些根之内。
+# 默认只放开 ~/Desktop 和 ~/Documents —— 把 ~/.ssh ~/.aws ~/.claude ~/Library 挡在外面。
+_DEFAULT_ROOTS = [str(Path.home() / "Desktop"), str(Path.home() / "Documents")]
+ALLOWED_ROOTS = [str(Path(r).expanduser().resolve())
+                 for r in (_cfg.get("allowed_roots") or _DEFAULT_ROOTS)]
+
+# 高危指令拦截：这些事必须你自己坐到电脑前做，不走远程通道。
+DANGER_PATTERNS = [
+    (r"\brm\s+-[a-zA-Z]*[rf]", "递归删除"),
+    (r"\bsudo\b", "sudo 提权"),
+    (r"(curl|wget)[^\n|]*\|\s*(ba)?sh", "下载即执行"),
+    (r"\bmkfs\b|\bdd\s+if=", "磁盘写入"),
+    (r"\.ssh\b|id_rsa|id_ed25519|authorized_keys", "SSH 凭据"),
+    (r"\.aws/credentials|\.claude\.json|keychain|security\s+find-generic-password", "凭据存储"),
+    (r"(^|[\s/])\.env\b", ".env 密钥文件"),
+    (r"force[- ]push|push\s+--force|reset\s+--hard", "不可逆 git 操作"),
+]
+
+def path_allowed(p):
+    """目录必须真实存在，且解析软链后落在白名单根之内。"""
+    try:
+        rp = Path(p).expanduser().resolve()
+    except Exception:
+        return False, None
+    if not rp.is_dir():
+        return False, None
+    for root in ALLOWED_ROOTS:
+        try:
+            rp.relative_to(root)
+            return True, str(rp)
+        except ValueError:
+            continue
+    return False, str(rp)
+
+def armed_left():
+    """还剩多少秒的提权时间；0 = 未提权。"""
+    until = state.get("_armed_until") or 0
+    return max(0, int(until - time.time()))
+
+def effective_mode():
+    return ELEVATED_MODE if armed_left() > 0 else BASE_MODE
+
+def scan_danger(text):
+    low = text.lower()
+    for pat, label in DANGER_PATTERNS:
+        if re.search(pat, low):
+            return label
+    return None
 
 # 状态文件：记住「当前工作目录」和「当前 session」，重启后不丢。
 STATE_FILE = Path.home() / ".feishu-claude-bridge" / "state.json"
@@ -109,7 +169,7 @@ def run_claude(prompt, session_id, workdir, chat_id, fork=False, model=None):
     带超时 + 心跳：防跑飞；长任务也让你知道它还活着，不假死。
     """
     cmd = ["claude", "-p", prompt, "--output-format", "json",
-           "--permission-mode", PERMISSION_MODE]
+           "--permission-mode", effective_mode()]
     if model:
         cmd += ["--model", model]
     if session_id:
@@ -532,7 +592,10 @@ HELP = """🤖 飞书↔Claude 桥接 · 用法
 命令速查：
   /watch 监控最近会话   /progress 看进度      /sessions 列历史会话
   /resume 飞书 接历史   /context 看上下文     /model opus 换模型
-  /cd 切目录   /new 开新会话   /pwd 看状态   /help 帮助"""
+  /cd 切目录   /new 开新会话   /pwd 看状态   /help 帮助
+
+安全（默认只能改文件，跑命令要先提权）：
+  /arm 口令 临时提权   /disarm 立即收回   /security 看当前安全状态"""
 
 def handle_message(text, chat_id):
     global state
@@ -576,7 +639,16 @@ def handle_message(text, chat_id):
 
     if text.startswith("/cd "):
         path = text[4:].strip()
-        p = Path(path).expanduser()
+        ok, rp = path_allowed(path)
+        if not ok:
+            if rp is None:
+                send_feishu(f"❌ 目录不存在：{path}", chat_id)
+            else:
+                send_feishu("🚫 这个目录不在白名单里，拒绝切换。\n"
+                            f"允许的根目录：\n" + "\n".join("  · " + r for r in ALLOWED_ROOTS) +
+                            "\n\n要放开就改 ~/.feishu-claude-bridge/config.json 的 allowed_roots。", chat_id)
+            return
+        p = Path(rp)
         if p.is_dir():
             state["workdir"] = str(p)
             state["session_id"] = None  # 换目录 → 重置会话
@@ -644,6 +716,39 @@ def handle_message(text, chat_id):
         send_feishu(f"没有「{arg}」这个模型。可选：opus / sonnet / haiku / fable / default", chat_id)
         return
 
+    if text.startswith("/arm"):
+        if not ARM_PASSPHRASE:
+            send_feishu("🚫 还没设提权口令，/arm 不可用。\n\n"
+                        "去 ~/.feishu-claude-bridge/config.json 加一行：\n"
+                        '  "arm_passphrase": "你自己想一个口令"\n\n'
+                        "然后重启桥接。设好之前只能改文件、不能跑命令。", chat_id)
+            return
+        given = text[4:].strip()
+        if given != ARM_PASSPHRASE:
+            send_feishu("🚫 口令不对，仍是只读改文件模式。", chat_id)
+            print("[bridge] /arm 口令错误", file=sys.stderr)
+            return
+        state["_armed_until"] = time.time() + ARM_TTL
+        save_state(state)
+        send_feishu(f"🔓 已提权 {ARM_TTL // 60} 分钟，现在能跑命令了。\n"
+                    "用完发 /disarm 立即收回。", chat_id)
+        return
+
+    if text == "/disarm":
+        state["_armed_until"] = 0
+        save_state(state)
+        send_feishu("🔒 已收回提权，回到「只能改文件」模式。", chat_id)
+        return
+
+    if text == "/security":
+        left = armed_left()
+        send_feishu("🛡️ 安全状态\n"
+                    f"  当前权限：{effective_mode()}" + (f"（提权剩 {left // 60} 分 {left % 60} 秒）" if left else "（未提权）") + "\n"
+                    f"  提权口令：{'已设置' if ARM_PASSPHRASE else '⚠️ 未设置，/arm 不可用'}\n"
+                    f"  当前目录：{state['workdir']}\n"
+                    "  目录白名单：\n" + "\n".join("    · " + r for r in ALLOWED_ROOTS), chat_id)
+        return
+
     if text == "/stop":
         send_feishu("（/stop 占位：当前版本任务跑完才会响应，暂不能中断）", chat_id)
         return
@@ -673,6 +778,15 @@ def handle_message(text, chat_id):
     topic = detect_resume_intent(text)
     if topic is not None:
         handle_resume_query(topic, chat_id)
+        return
+
+    # ---- 高危指令：不走远程通道，让他自己坐到电脑前做 ----
+    hit = scan_danger(text)
+    if hit is not None:
+        send_feishu(f"🚫 这条指令涉及「{hit}」，远程通道不执行。\n"
+                    "这类操作请你自己坐到电脑前做。\n"
+                    "（判断规则在 bridge.py 的 DANGER_PATTERNS，误伤了就去改。）", chat_id)
+        print(f"[bridge] 拦截高危指令: {hit}", file=sys.stderr)
         return
 
     # ---- 普通指令 → 交给 Claude ----
@@ -720,7 +834,23 @@ def main():
         print("[bridge] ❌ 未配置 owner_open_id。请在 ~/.feishu-claude-bridge/config.json 里设置"
               "（复制 config.example.json，open_id 用 `lark-cli auth status` 可查）。", file=sys.stderr)
         sys.exit(1)
-    print(f"[bridge] 启动。OWNER={OWNER_OPEN_ID} workdir={state['workdir']}", file=sys.stderr)
+    ok, rp = path_allowed(state.get("workdir") or "")
+    if not ok:
+        fallback = ALLOWED_ROOTS[0]
+        print(f"[bridge] ⚠️ 工作目录不在白名单，已回落到 {fallback}", file=sys.stderr)
+        state["workdir"] = fallback
+        state["session_id"] = None
+        save_state(state)
+    if state.get("_armed_until"):   # 重启一律降权，提权不跨进程存活
+        state["_armed_until"] = 0
+        save_state(state)
+    if _LEGACY_BYPASS:
+        print("[bridge] ⚠️ config 里的 permission_mode=bypassPermissions 已被收敛为 acceptEdits；"
+              "跑命令请先 /arm（需先在 config 设 arm_passphrase）", file=sys.stderr)
+    if not ARM_PASSPHRASE:
+        print("[bridge] ⚠️ 未设 arm_passphrase，/arm 不可用，当前只能改文件不能跑命令", file=sys.stderr)
+    print(f"[bridge] 启动。OWNER={OWNER_OPEN_ID} workdir={state['workdir']} mode={BASE_MODE} "
+          f"roots={ALLOWED_ROOTS}", file=sys.stderr)
     seen_events = set()
 
     while True:  # 断线自动重连
