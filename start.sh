@@ -47,4 +47,5 @@ echo "[start] $(date) 启动桥接…" >> "$LOG"
 KEEP=""
 command -v caffeinate >/dev/null 2>&1 && KEEP="caffeinate -s"
 # 不用 exec：让有 FDA 的 bash 留作父进程，子进程(python/claude)才稳继承磁盘权限
-$KEEP "$PY" bridge.py >> "$LOG" 2>&1
+# 绝对路径：Windows 的 start-bridge.ps1 靠命令行里的完整路径认出「本目录的」桥接，不误杀别的项目
+$KEEP "$PY" "$(pwd)/bridge.py" >> "$LOG" 2>&1

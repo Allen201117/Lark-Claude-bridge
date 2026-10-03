@@ -950,7 +950,7 @@ def main():
                     send_feishu(f"❌ 桥接内部出错：{e}", chat_id)
         except KeyboardInterrupt:
             print("[bridge] 收到中断，退出。", file=sys.stderr)
-            kill_tree(proc)
+            kill_tree(proc, graceful=True)
             break
         finally:
             err_fh.close()

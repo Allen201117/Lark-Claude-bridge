@@ -29,7 +29,9 @@ _CREATE_NO_WINDOW = 0x08000000
 POPEN_KW = {"creationflags": _CREATE_NO_WINDOW} if IS_WIN else {}
 
 # npm 的 cmd-shim 里真正的目标长这样：  "%dp0%\node_modules\pkg\bin\claude.exe"  %*
-_SHIM_TARGET_RE = re.compile(r'"%~?dp0%?[\\/]+([^"]+)"', re.I)
+# 只认后面紧跟 %* 的那一句（真正执行的那行）。前面 IF EXIST "%dp0%\node.exe" 是探测行，
+# 认成目标会变成「node.exe -p <消息>」——飞书消息被当 JS 执行。
+_SHIM_TARGET_RE = re.compile(r'"%~?dp0%?[\\/]+([^"]+)"\s*%\*', re.I)
 _SHIM_PROG_RE = re.compile(r'SET\s+"_prog=([^"]+)"', re.I)
 
 
@@ -73,8 +75,8 @@ def resolve_cli(name):
     return [path]
 
 
-def kill_tree(proc):
-    """杀掉 proc 及它派生的所有子进程。"""
+def kill_tree(proc, graceful=False):
+    """杀掉 proc 及它派生的所有子进程。graceful=True 时 Mac/Linux 发 SIGTERM（原行为），否则 SIGKILL。"""
     if IS_WIN:
         try:
             subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
@@ -82,7 +84,7 @@ def kill_tree(proc):
         except Exception:
             pass
     try:
-        proc.kill()
+        proc.terminate() if graceful else proc.kill()
     except Exception:
         pass
 

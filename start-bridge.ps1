@@ -32,11 +32,15 @@ function Find-GitBash {
 function Get-BridgeProcs {
     # 旧实例：看守者（另一个 start-bridge.ps1 -Supervise，不先杀它会把桥接重新拉起来）、
     # 包着桥接的 bash start.sh、python 跑着的 bridge.py。看守者排最前，先杀。
+    # bash / python 只认命令行里带本目录绝对路径的（start.sh 和 bridge.py 都按绝对路径启动），
+    # 别的项目里同名的 start.sh / bridge.py 不会被误杀。
+    $here = ($dir -replace '\\', '/').ToLower()
     $all = Get-CimInstance Win32_Process | Where-Object {
-        $_.ProcessId -ne $PID -and $_.CommandLine -and (
-            ($_.Name -match '^(powershell|pwsh)\.exe$' -and $_.CommandLine -match 'start-bridge\.ps1') -or
-            ($_.Name -eq 'bash.exe' -and $_.CommandLine -match 'start\.sh') -or
-            ($_.Name -match '^pythonw?\d*\.exe$' -and $_.CommandLine -match 'bridge\.py'))
+        $cl = if ($_.CommandLine) { ($_.CommandLine -replace '\\', '/').ToLower() } else { '' }
+        $_.ProcessId -ne $PID -and $cl -and (
+            ($_.Name -match '^(powershell|pwsh)\.exe$' -and $cl -match 'start-bridge\.ps1') -or
+            ($_.Name -eq 'bash.exe' -and $cl.Contains("$here/start.sh")) -or
+            ($_.Name -match '^pythonw?\d*\.exe$' -and $cl.Contains("$here/bridge.py")))
     }
     $all | Sort-Object { if ($_.Name -match 'powershell|pwsh') { 0 } elseif ($_.Name -eq 'bash.exe') { 1 } else { 2 } }
 }
@@ -59,13 +63,13 @@ Stop-Bridge   # 先停旧的，避免两个实例抢同一批消息
 
 if ($Supervise) {
     while ($true) {
-        $p = Start-Process -FilePath $bash -ArgumentList 'start.sh' -WorkingDirectory $dir -WindowStyle Hidden -PassThru -Wait
+        $p = Start-Process -FilePath $bash -ArgumentList "`"$dir\start.sh`"" -WorkingDirectory $dir -WindowStyle Hidden -PassThru -Wait
         Add-Content -Path $log -Encoding UTF8 -Value "[supervise] $(Get-Date) start.sh 退出（exit=$($p.ExitCode)），10 秒后重启"
         Start-Sleep -Seconds 10
     }
 }
 
-Start-Process -FilePath $bash -ArgumentList 'start.sh' -WorkingDirectory $dir -WindowStyle Hidden | Out-Null
+Start-Process -FilePath $bash -ArgumentList "`"$dir\start.sh`"" -WorkingDirectory $dir -WindowStyle Hidden | Out-Null
 Start-Sleep -Seconds 3
 if (@(Get-BridgeProcs | Where-Object { $_.CommandLine -match 'bridge\.py' }).Count -gt 0) {
     Write-Host '飞书↔Claude 桥接已启动，现在可以关掉这个窗口了。'
