@@ -16,10 +16,13 @@ import difflib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+from platform_util import POPEN_KW, keep_awake, kill_tree, resolve_cli
 
 # ─────────────────────────── 配置 ───────────────────────────
 # 个人配置放 ~/.feishu-claude-bridge/config.json（不进仓库）。参见 config.example.json。
@@ -27,7 +30,7 @@ CONFIG_FILE = Path.home() / ".feishu-claude-bridge" / "config.json"
 
 def load_config():
     try:
-        return json.loads(CONFIG_FILE.read_text())
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -66,9 +69,14 @@ DANGER_PATTERNS = [
     (r"(curl|wget)[^\n|]*\|\s*(ba)?sh", "下载即执行"),
     (r"\bmkfs\b|\bdd\s+if=", "磁盘写入"),
     (r"\.ssh\b|id_rsa|id_ed25519|authorized_keys", "SSH 凭据"),
-    (r"\.aws/credentials|\.claude\.json|keychain|security\s+find-generic-password", "凭据存储"),
-    (r"(^|[\s/])\.env\b", ".env 密钥文件"),
+    (r"\.aws[/\\]credentials|\.claude\.json|keychain|security\s+find-generic-password|cmdkey|vaultcmd", "凭据存储"),
+    (r"(^|[\s/\\])\.env\b", ".env 密钥文件"),
     (r"force[- ]push|push\s+--force|reset\s+--hard", "不可逆 git 操作"),
+    # Windows 对应项（文本已转小写，这里全写小写）
+    (r"remove-item[^\n]*-recurse|\b(del|erase)\s+/[sq]|\b(rmdir|rd)\s+/s", "递归删除（Windows）"),
+    (r"\bformat\s+[a-z]:|\breg\s+delete\b", "磁盘格式化 / 注册表删除"),
+    (r"(iwr|irm|invoke-webrequest|invoke-restmethod|curl|wget)[^\n|]*\|\s*(iex|invoke-expression)", "下载即执行（Windows）"),
+    (r"-verb\s+runas", "提权运行（Windows）"),
 ]
 
 def path_allowed(p):
@@ -125,14 +133,14 @@ CONSUME_ERR_LOG = LOG_DIR / "consume.stderr.log"
 def load_state():
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except Exception:
             pass
     return {"workdir": DEFAULT_WORKDIR, "session_id": None, "last_chat_id": None}
 
 def save_state(st):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=2))
+    STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
 
 state = load_state()
 
@@ -145,13 +153,14 @@ def send_feishu(text, chat_id=None):
     parts = [text[i:i + CHUNK] for i in range(0, len(text), CHUNK)] or [text]
     for idx, part in enumerate(parts):
         prefix = f"[{idx+1}/{len(parts)}] " if len(parts) > 1 else ""
-        cmd = ["lark-cli", "im", "+messages-send", "--as", "bot", "--text", prefix + part]
-        if chat_id:
-            cmd += ["--chat-id", chat_id]
-        else:
-            cmd += ["--user-id", OWNER_OPEN_ID]
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            cmd = resolve_cli("lark-cli") + ["im", "+messages-send", "--as", "bot", "--text", prefix + part]
+            if chat_id:
+                cmd += ["--chat-id", chat_id]
+            else:
+                cmd += ["--user-id", OWNER_OPEN_ID]
+            subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=30, **POPEN_KW)
         except Exception as e:
             print(f"[bridge] 发消息失败: {e}", file=sys.stderr)
 
@@ -168,8 +177,13 @@ def run_claude(prompt, session_id, workdir, chat_id, fork=False, model=None):
     model：opus/sonnet/haiku/fable 或完整模型名；None=用默认。
     带超时 + 心跳：防跑飞；长任务也让你知道它还活着，不假死。
     """
-    cmd = ["claude", "-p", prompt, "--output-format", "json",
-           "--permission-mode", effective_mode()]
+    try:
+        # Windows 上 claude 是 npm 的 .cmd 包装脚本：这里解析成真实 claude.exe，
+        # 免得消息内容被 cmd.exe 截断 / 当命令执行（Mac 上 = ["claude"]，不变）
+        cmd = resolve_cli("claude") + ["-p", prompt, "--output-format", "json",
+                                       "--permission-mode", effective_mode()]
+    except Exception as e:
+        return (f"❌ 找不到 Claude：{e}", session_id, True)
     if model:
         cmd += ["--model", model]
     if session_id:
@@ -177,8 +191,10 @@ def run_claude(prompt, session_id, workdir, chat_id, fork=False, model=None):
         if fork:
             cmd += ["--fork-session"]
     try:
+        # stdin 接空设备：-p 模式不该去读桥接自己的 stdin（后台常驻时那是个永不 EOF 的句柄）
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, cwd=workdir)
+                                stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                errors="replace", cwd=workdir, **POPEN_KW)
     except Exception as e:
         return (f"❌ 启动 Claude 失败：{e}", session_id, True)
 
@@ -191,7 +207,7 @@ def run_claude(prompt, session_id, workdir, chat_id, fork=False, model=None):
         except subprocess.TimeoutExpired:
             now = time.time()
             if now - start > CLAUDE_TIMEOUT:
-                proc.kill()
+                kill_tree(proc)
                 try:
                     proc.communicate(timeout=10)
                 except Exception:
@@ -229,8 +245,9 @@ def run_claude(prompt, session_id, workdir, chat_id, fork=False, model=None):
 
 # ─────────────────────────── 列出历史 session ───────────────────────────
 def encode_project_path(workdir):
-    """~/.claude/projects 下的目录名规则：把路径里的 / 换成 -。"""
-    return str(workdir).replace("/", "-")
+    """~/.claude/projects 下的目录名规则：路径里所有非字母数字的字符都换成 -。
+    （Mac：/Users/a/b → -Users-a-b；Windows 的盘符冒号和反斜杠同样换成 -，所以 C 盘用户目录变成 C--Users-…；. 和 _ 也会被换掉）"""
+    return re.sub(r"[^a-zA-Z0-9]", "-", str(workdir))
 
 def list_sessions(workdir, limit=10):
     """列出当前工作目录对应的历史 session（就是你桌面端存过的会话）。"""
@@ -249,7 +266,7 @@ def list_sessions(workdir, limit=10):
 def first_user_message(jsonl_path):
     """读 session 文件里第一条用户消息，做个摘要，帮你认出是哪个会话。"""
     try:
-        with open(jsonl_path, "r") as fh:
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 try:
                     obj = json.loads(line)
@@ -282,7 +299,7 @@ def last_assistant_text(tpath):
     """transcript 里最后一条助手的文字消息。"""
     txt = ""
     try:
-        with open(tpath) as fh:
+        with open(tpath, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 try:
                     o = json.loads(line)
@@ -302,7 +319,7 @@ def last_exchange(tpath):
     """返回 (最后一条用户消息, 最后一条助手消息)，用于「上次聊到哪」预览。"""
     lu = la = ""
     try:
-        with open(tpath) as fh:
+        with open(tpath, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 try:
                     o = json.loads(line)
@@ -363,7 +380,7 @@ WATCH_FILE = LOG_DIR / "watch.json"
 
 def load_watch():
     try:
-        return json.loads(WATCH_FILE.read_text())
+        return json.loads(WATCH_FILE.read_text(encoding="utf-8"))
     except Exception:
         return []
 
@@ -372,13 +389,13 @@ def add_watch(sid):
     if sid not in w:
         w.append(sid)
     try:
-        WATCH_FILE.write_text(json.dumps(w, ensure_ascii=False))
+        WATCH_FILE.write_text(json.dumps(w, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
 def most_recent_sessions(exclude, limit=5):
     """所有项目里最近活动的会话（排除桥接自己建的 + 当前会话）。"""
-    files = [f for f in CLAUDE_PROJECTS.glob("*/*.jsonl") if "/subagents/" not in str(f)]
+    files = [f for f in CLAUDE_PROJECTS.glob("*/*.jsonl") if "/subagents/" not in f.as_posix()]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     out = []
     for f in files:
@@ -428,7 +445,7 @@ def recent_activity(tpath, n=6):
     """最近几条动作：助手说的话 💬 + 用了什么工具 🔧。用于「看进度」。"""
     events = []
     try:
-        with open(tpath) as fh:
+        with open(tpath, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 try:
                     o = json.loads(line)
@@ -828,11 +845,38 @@ def extract_text(evt):
         return s
     return ""
 
+# ─────────────────────────── 环境自检（python bridge.py --check）───────────────────────────
+def check_env():
+    """只检查环境：找得到 claude / lark-cli 吗、配置在不在。不连飞书、不跑任务。"""
+    ok = True
+    print(f"python   : {sys.version.split()[0]}  {sys.executable}  ({sys.platform})")
+    for name in ("claude", "lark-cli"):
+        try:
+            if not shutil.which(name):
+                raise FileNotFoundError(f"PATH 里找不到 {name}")
+            argv = resolve_cli(name)
+            extra = ""
+            if name == "claude":
+                r = subprocess.run(argv + ["--version"], capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=30, stdin=subprocess.DEVNULL, **POPEN_KW)
+                extra = "  ->  " + ((r.stdout or r.stderr).strip() or f"exit {r.returncode}")
+            print(f"{name:9}: {' '.join(argv)}{extra}")
+        except Exception as e:
+            ok = False
+            print(f"{name:9}: [X] {e}")
+    print(f"config   : {'存在' if CONFIG_FILE.exists() else '不存在'}  {CONFIG_FILE}")
+    print(f"owner    : {'已配置' if OWNER_OPEN_ID else '[X] 未配置'}")
+    print(f"projects : {'存在' if CLAUDE_PROJECTS.is_dir() else '不存在'}  {CLAUDE_PROJECTS}")
+    return 0 if ok and OWNER_OPEN_ID else 1
+
 # ─────────────────────────── 主循环 ───────────────────────────
 def main():
     if not OWNER_OPEN_ID:
         print("[bridge] ❌ 未配置 owner_open_id。请在 ~/.feishu-claude-bridge/config.json 里设置"
               "（复制 config.example.json，open_id 用 `lark-cli auth status` 可查）。", file=sys.stderr)
+        sys.exit(1)
+    if not shutil.which("lark-cli"):
+        print("[bridge] ❌ PATH 里找不到 lark-cli（见 README 依赖）。装好并授权后再启动。", file=sys.stderr)
         sys.exit(1)
     ok, rp = path_allowed(state.get("workdir") or "")
     if not ok:
@@ -851,16 +895,21 @@ def main():
         print("[bridge] ⚠️ 未设 arm_passphrase，/arm 不可用，当前只能改文件不能跑命令", file=sys.stderr)
     print(f"[bridge] 启动。OWNER={OWNER_OPEN_ID} workdir={state['workdir']} mode={BASE_MODE} "
           f"roots={ALLOWED_ROOTS}", file=sys.stderr)
+    if keep_awake():  # Windows 版 caffeinate -s（Mac 上由 start.sh 的 caffeinate 负责）
+        print("[bridge] 已开启防睡眠（SetThreadExecutionState）", file=sys.stderr)
     seen_events = set()
 
     while True:  # 断线自动重连
-        err_fh = open(CONSUME_ERR_LOG, "a")
+        err_fh = open(CONSUME_ERR_LOG, "a", encoding="utf-8", errors="replace")
         proc = subprocess.Popen(
-            ["lark-cli", "event", "consume", EVENT_KEY, "--as", "bot"],
+            resolve_cli("lark-cli") + ["event", "consume", EVENT_KEY, "--as", "bot"],
             stdout=subprocess.PIPE,
             stderr=err_fh,
             stdin=subprocess.PIPE,   # 关键：保持 stdin 打开，否则 EOF 会让它立刻优雅退出
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            **POPEN_KW,
         )
         print(f"[bridge] event consume 已连接（pid={proc.pid}），等待飞书消息…", file=sys.stderr)
         try:
@@ -901,10 +950,7 @@ def main():
                     send_feishu(f"❌ 桥接内部出错：{e}", chat_id)
         except KeyboardInterrupt:
             print("[bridge] 收到中断，退出。", file=sys.stderr)
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+            kill_tree(proc)
             break
         finally:
             err_fh.close()
@@ -915,4 +961,6 @@ def main():
         time.sleep(3)
 
 if __name__ == "__main__":
+    if "--check" in sys.argv[1:]:
+        sys.exit(check_env())
     main()

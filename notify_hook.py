@@ -12,20 +12,32 @@ import os
 import json
 import subprocess
 
+try:  # Windows：不弹黑窗口（Mac 上是空字典）；导入失败也不影响钩子
+    from platform_util import POPEN_KW
+except Exception:
+    POPEN_KW = {}
+
 BASE = os.path.expanduser("~/.feishu-claude-bridge")
 WATCH = os.path.join(BASE, "watch.json")
 
 def _owner():
     try:
-        return json.load(open(os.path.join(BASE, "config.json"))).get("owner_open_id", "") \
-            or os.environ.get("FCB_OWNER_OPEN_ID", "")
+        with open(os.path.join(BASE, "config.json"), encoding="utf-8") as fh:
+            return json.load(fh).get("owner_open_id", "") or os.environ.get("FCB_OWNER_OPEN_ID", "")
     except Exception:
         return os.environ.get("FCB_OWNER_OPEN_ID", "")
 
 def _lark():
+    """返回 lark-cli 的 argv 前缀（列表）。Windows 上要绕开 npm 的 .cmd 包装脚本，见 platform_util.py。"""
     import shutil
     p = os.path.expanduser("~/.npm-global/bin/lark-cli")
-    return p if os.path.exists(p) else (shutil.which("lark-cli") or p)
+    if sys.platform == "win32":
+        try:
+            from platform_util import resolve_cli
+            return resolve_cli("lark-cli")
+        except Exception:
+            return [p]
+    return [p if os.path.exists(p) else (shutil.which("lark-cli") or p)]
 
 OWNER = _owner()
 LARK = _lark()
@@ -35,7 +47,7 @@ def last_assistant_text(tpath):
     """读 transcript，返回最后一条助手的文字消息。"""
     txt = ""
     try:
-        with open(tpath, "r") as fh:
+        with open(tpath, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 try:
                     o = json.loads(line)
@@ -62,7 +74,8 @@ def main():
     if not sid or not os.path.exists(WATCH):
         return
     try:
-        watch = json.load(open(WATCH))
+        with open(WATCH, encoding="utf-8") as fh:
+            watch = json.load(fh)
     except Exception:
         return
     if sid not in watch:
@@ -70,7 +83,8 @@ def main():
 
     # 一次性：通知后从监控列表移除，避免每轮都刷屏
     try:
-        json.dump([w for w in watch if w != sid], open(WATCH, "w"))
+        with open(WATCH, "w", encoding="utf-8") as fh:
+            json.dump([w for w in watch if w != sid], fh)
     except Exception:
         pass
 
@@ -79,9 +93,9 @@ def main():
     text = (f"🔔 你监控的会话跑完一轮了！\n会话 {sid}\n\n最后说：\n{preview}\n\n"
             f"（想接着这个会话聊，在这直接发：接上会话 {sid[:8]}）")
     try:
-        subprocess.run([LARK, "im", "+messages-send", "--as", "bot",
-                        "--user-id", OWNER, "--text", text],
-                       capture_output=True, timeout=25)
+        subprocess.run(LARK + ["im", "+messages-send", "--as", "bot",
+                               "--user-id", OWNER, "--text", text],
+                       capture_output=True, timeout=25, **POPEN_KW)
     except Exception:
         pass
 
